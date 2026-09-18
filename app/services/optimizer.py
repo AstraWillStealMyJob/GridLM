@@ -17,25 +17,46 @@ def _v(h: int, k: int) -> int:
     return 5 * h + k
 
 
+def _adj(d: Directive) -> dict:
+    """
+    Narrow Optional[dict] to dict.
+
+    Guardrails guarantee structured_adjustment is non-None for every
+    non-no_op directive; this accessor makes that contract explicit to
+    the type checker and enforces it at runtime.
+    """
+    if d.structured_adjustment is None:
+        raise RuntimeError(
+            f"directive {d.directive_type} missing structured_adjustment"
+        )
+    return d.structured_adjustment
+
+
 def build_effective_solar(hours: list[dict], directives: list[Directive]) -> list[float]:
     """Apply solar_reduction directives to the base solar profile."""
     eff = [float(h["solar_kwh"]) for h in hours]
     for d in directives:
         if d.directive_type == "solar_reduction":
-            factor = float(d.structured_adjustment["factor"])
-            for h in d.structured_adjustment["hours"]:
+            adj = _adj(d)
+            factor = float(adj["factor"])
+            for h in adj["hours"]:
                 eff[h] *= factor
     return eff
 
 
-def build_min_reserve(hours: list[dict], battery: dict, directives: list[Directive]) -> list[float]:
+def build_min_reserve(
+    hours: list[dict],
+    battery: dict,
+    directives: list[Directive],
+) -> list[float]:
     """Apply minimum_battery_reserve directives to the base reserve."""
     base = float(battery["minimum_energy_kwh"])
     reserves = [base] * HORIZON
     for d in directives:
         if d.directive_type == "minimum_battery_reserve":
-            r = float(d.structured_adjustment["minimum_energy_kwh"])
-            for h in d.structured_adjustment["hours"]:
+            adj = _adj(d)
+            r = float(adj["minimum_energy_kwh"])
+            for h in adj["hours"]:
                 reserves[h] = max(reserves[h], r)
     return reserves
 
@@ -68,15 +89,19 @@ def optimize(
 
     for d in directives:
         if d.directive_type == "no_charge_window":
-            for h in d.structured_adjustment["hours"]:
+            adj = _adj(d)
+            for h in adj["hours"]:
                 charge_cap[h] = 0.0
         elif d.directive_type == "no_discharge_window":
-            for h in d.structured_adjustment["hours"]:
+            adj = _adj(d)
+            for h in adj["hours"]:
                 discharge_cap[h] = 0.0
         elif d.directive_type == "max_grid_window":
-            cap_g = float(d.structured_adjustment["max_grid_kwh"])
-            for h in d.structured_adjustment["hours"]:
-                grid_cap[h] = cap_g if grid_cap[h] is None else min(grid_cap[h], cap_g)
+            adj = _adj(d)
+            cap_g = float(adj["max_grid_kwh"])
+            for h in adj["hours"]:
+                existing = grid_cap[h]
+                grid_cap[h] = cap_g if existing is None else min(existing, cap_g)
 
     bounds = []
     for h in range(HORIZON):
