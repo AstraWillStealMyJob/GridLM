@@ -1,4 +1,3 @@
-"""Thin Groq client wrapper with JSON-mode support."""
 from __future__ import annotations
 
 import json
@@ -9,6 +8,10 @@ from groq import Groq
 
 
 _DEFAULT_TIMEOUT = 20.0  # seconds
+
+# Primary = 20B (fast, cheap). Fallback = 120B if 20B is unavailable.
+PRIMARY_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
+FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
 
 
 class GroqJSONError(RuntimeError):
@@ -22,38 +25,62 @@ def _client() -> Groq:
     return Groq(api_key=api_key, timeout=_DEFAULT_TIMEOUT)
 
 
-def call_json(
+def _call_one_model(
+    model: str,
     system_prompt: str,
     user_prompt: str,
-    *,
-    temperature: float = 0.0,
-    max_tokens: int = 2048,
+    temperature: float,
+    max_tokens: int,
 ) -> dict[str, Any]:
-    """
-    Call Groq with JSON-mode response format and return the parsed dict.
-
-    Raises GroqJSONError on malformed JSON.
-    """
-    model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
     client = _client()
-
     resp = client.chat.completions.create(
         model=model,
         temperature=temperature,
-        max_tokens=max_tokens,
+        max_completion_tokens=max_tokens,
         response_format={"type": "json_object"},
+        # GPT-OSS family: suppress reasoning tokens for clean JSON output.
+        # Do NOT set reasoning_format here -- it's Qwen3-only and will error.
+        include_reasoning=False,
+        reasoning_effort="low",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
     )
-
-    content = resp.choices[0].message.content or ""
-    content = content.strip()
+    content = (resp.choices[0].message.content or "").strip()
     if not content:
-        raise GroqJSONError("empty response from Groq")
-
+        raise GroqJSONError(f"empty response from {model}")
     try:
         return json.loads(content)
     except json.JSONDecodeError as exc:
-        raise GroqJSONError(f"Groq returned non-JSON: {exc}") from exc
+        raise GroqJSONError(f"{model} returned non-JSON: {exc}") from exc
+
+
+def call_json(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    temperature: float = 0.0,
+    max_tokens: int = 1024,
+) -> dict[str, Any]:
+    """
+    Call Groq with JSON-mode response format.
+
+    Tries PRIMARY_MODEL first, then FALLBACK_MODEL on failure.
+    Raises GroqJSONError if both fail.
+    """
+    last_error: Exception | None = None
+    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
+        try:
+            return _call_one_model(
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            continue
+
+    raise GroqJSONError(f"all models failed: {last_error}")

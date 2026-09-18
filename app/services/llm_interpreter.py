@@ -83,8 +83,8 @@ def _build_user_prompt(
     return (
         "BATTERY:\n"
         + json.dumps(battery_view, indent=2)
-        + "\n\nHOURS:\n"
-        + json.dumps(hour_view, indent=2)
+#        + "\n\nHOURS:\n"
+#        + json.dumps(hour_view, indent=2)
         + "\n\nOPERATOR NOTES:\n"
         + json.dumps(operator_notes, indent=2)
     )
