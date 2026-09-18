@@ -11,7 +11,7 @@ _DEFAULT_TIMEOUT = 20.0  # seconds
 
 # Primary = 20B (fast, cheap). Fallback = 120B if 20B is unavailable.
 PRIMARY_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
-FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
+FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "openai/gpt-oss-120b")
 
 
 class GroqJSONError(RuntimeError):
