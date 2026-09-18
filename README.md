@@ -41,7 +41,7 @@ GridLM's job is to read those notes, decide which ones matter, convert the relev
 ## Pipeline
 
 ```text
-Client / Judge
+    Client
       │
       ▼
  FastAPI application
@@ -116,7 +116,7 @@ requirements.txt
 ### Running locally
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/AstraWillStealMyJob/GridLM
 cd GridLM
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -158,14 +158,14 @@ docker run --rm -p 8080:8080 --env-file .env gridlm
 A prebuilt image is published to GitHub Container Registry on every push to `main` and is publicly pullable — no registry login required.
 
 ```bash
-docker pull ghcr.io/<owner>/gridlm:latest
-docker run --rm -p 8080:8080 --env-file .env ghcr.io/<owner>/gridlm:latest
+docker pull ghcr.io/astrawillstealmyjob/gridlm:latest
+docker run --rm -p 8080:8080 --env-file .env ghcr.io/astrawillstealmyjob/gridlm:latest
 ```
 
 A version-pinned tag is also available:
 
 ```bash
-docker pull ghcr.io/<owner>/gridlm:1.0.0
+docker pull ghcr.io/astrawillstealmyjob/gridlm:1.0.0
 ```
 
 Either way, verify readiness the same way:
