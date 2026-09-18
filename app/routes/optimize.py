@@ -1,37 +1,78 @@
+"""POST /optimize-energy route."""
+from __future__ import annotations
+
 from fastapi import APIRouter, HTTPException
 
-from app.schemas import OptimizeRequest
-from app.services.llm_interpreter import interpret_operator_notes
+from app.schemas import (
+    DirectiveInterpretation,
+    OptimizeRequest,
+    OptimizeResponse,
+)
+from app.services.groq_client import GroqJSONError
+from app.services.guardrails import GuardrailError, validate_interpretation
+from app.services.llm_interpreter import interpret_notes, interpret_notes_with_retry
+from app.services.optimizer import optimize
 
-router = APIRouter(tags=["optimization"])
+
+router = APIRouter()
 
 
-@router.post("/optimize-energy")
-def optimize_energy(request: OptimizeRequest) -> dict:
-    """Starter endpoint.
+@router.post("/optimize-energy", response_model=OptimizeResponse)
+def optimize_energy(req: OptimizeRequest) -> OptimizeResponse:
+    hours = [h.model_dump() for h in req.hours]
+    battery = req.battery.model_dump()
 
-    For now this wires the request into the Groq interpretation stage.
-    The deterministic guardrails + 24-hour optimizer are the next modules to add.
-    """
-    # Validate hour ordering/coverage at the API boundary.
-    hours = [item.hour for item in request.hours]
-    if hours != list(range(24)):
-        raise HTTPException(
-            status_code=400,
-            detail="hours must contain exactly 24 entries in ascending order from 0 to 23",
-        )
-
+    # 1. LLM interpretation (untrusted)
     try:
-        directive_interpretation = interpret_operator_notes(request.operator_notes)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail="LLM interpretation failed") from exc
+        raw = interpret_notes(req.operator_notes, hours, battery)
+    except GroqJSONError as exc:
+        raise HTTPException(status_code=502, detail=f"LLM error: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"LLM unavailable: {exc}")
 
-    return {
-        "scenario_id": request.scenario_id,
-        "directive_interpretation": directive_interpretation,
-        "hourly_plan": [],
-        "total_grid_kwh": 0,
-        "total_cost_bdt": 0,
-        "peak_grid_kwh": 0,
-        "plan_summary": "Starter implementation: LLM interpretation is wired; optimizer not implemented yet.",
-    }
+    # 2. Deterministic guardrails
+    try:
+        directives = validate_interpretation(raw, req.operator_notes, battery)
+    except GuardrailError as first_err:
+        # One-shot retry with the guardrail message fed back to the model.
+        try:
+            raw_retry = interpret_notes_with_retry(
+                req.operator_notes, hours, battery, str(first_err)
+            )
+            directives = validate_interpretation(raw_retry, req.operator_notes, battery)
+        except (GuardrailError, GroqJSONError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"invalid LLM interpretation: {exc}",
+            )
+
+    # 3. Optimization
+    try:
+        result = optimize(hours, battery, directives)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"optimizer failed: {exc}")
+
+    # 4. Assemble response (Pydantic validates shapes here)
+    interpretation = [
+        DirectiveInterpretation(
+            note_index=d.note_index,
+            applies=d.applies,
+            directive_type=d.directive_type,  # type: ignore[arg-type]
+            structured_adjustment=d.structured_adjustment,
+            explanation=d.explanation,
+        )
+        for d in directives
+    ]
+
+    return OptimizeResponse(
+        scenario_id=req.scenario_id,
+        directive_interpretation=interpretation,
+        hourly_plan=result["hourly_plan"],
+        total_grid_kwh=result["total_grid_kwh"],
+        total_cost_bdt=result["total_cost_bdt"],
+        peak_grid_kwh=result["peak_grid_kwh"],
+        plan_summary=(
+            "Optimized 24-hour schedule respecting all applicable "
+            "operator directives."
+        ),
+    )
