@@ -61,7 +61,7 @@ def call_json(
     user_prompt: str,
     *,
     temperature: float = 0.0,
-    max_tokens: int = 1024,
+    max_tokens: int = 256,
 ) -> dict[str, Any]:
     """
     Call Groq with JSON-mode response format.

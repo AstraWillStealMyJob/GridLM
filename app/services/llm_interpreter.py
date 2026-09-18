@@ -1,18 +1,75 @@
 """LLM-based operator-note interpreter for GridWise."""
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import threading
+from collections import OrderedDict
 from typing import Any
 
 from .groq_client import GroqJSONError, call_json
 
+logger = logging.getLogger(__name__)
 
+
+# --- interpretation cache ---------------------------------------------------
+
+_CACHE_MAX = 256
+_cache: "OrderedDict[str, dict]" = OrderedDict()
+_cache_lock = threading.Lock()
+
+
+def _cache_key(operator_notes: list[str], battery: dict) -> str:
+    payload = json.dumps(
+        {
+            "notes": list(operator_notes),
+            "capacity_kwh": float(battery["capacity_kwh"]),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _cache_get(key: str) -> dict | None:
+    with _cache_lock:
+        if key not in _cache:
+            return None
+        _cache.move_to_end(key)
+        return _cache[key]
+
+
+def _cache_put(key: str, value: dict) -> None:
+    with _cache_lock:
+        _cache[key] = value
+        _cache.move_to_end(key)
+        while len(_cache) > _CACHE_MAX:
+            _cache.popitem(last=False)
+
+
+def clear_cache() -> None:
+    with _cache_lock:
+        _cache.clear()
+
+
+def cache_stats() -> dict:
+    with _cache_lock:
+        return {"size": len(_cache), "max": _CACHE_MAX}
+
+
+def _looks_cacheable(raw: dict) -> bool:
+    interp = raw.get("directive_interpretation")
+    return isinstance(interp, list) and len(interp) > 0
+
+
+# --- prompt construction ----------------------------------------------------
+
+# IMPORTANT: The word "json" MUST appear in this string.
+# Groq rejects response_format={"type": "json_object"} otherwise.
 SYSTEM_PROMPT = """\
-You are a strict energy-directive interpreter for a 24-hour campus microgrid.
+You convert campus energy operator notes into strict JSON directives.
 
-You will receive operator notes and must convert EACH note into exactly one
-directive entry. Return ONLY JSON of this exact shape:
-
+Return ONLY a JSON object of this exact shape:
 {
   "directive_interpretation": [
     {
@@ -25,76 +82,41 @@ directive entry. Return ONLY JSON of this exact shape:
   ]
 }
 
-Allowed directive_type values and their exact structured_adjustment shapes:
-- "solar_reduction":
-    {"hours": [int, ...], "factor": <float 0..1>}
-    factor = usable fraction REMAINING. "80% reduction" -> 0.2.
-- "minimum_battery_reserve":
-    {"hours": [int, ...], "minimum_energy_kwh": <float>}
-- "no_charge_window":
-    {"hours": [int, ...]}
-- "no_discharge_window":
-    {"hours": [int, ...]}
-- "max_grid_window":
-    {"hours": [int, ...], "max_grid_kwh": <float>}
-- "no_op":
-    null
+Directive types and their structured_adjustment shape:
+- solar_reduction:          {"hours": [int], "factor": 0.0-1.0}
+- minimum_battery_reserve:  {"hours": [int], "minimum_energy_kwh": float}
+- no_charge_window:         {"hours": [int]}
+- no_discharge_window:      {"hours": [int]}
+- max_grid_window:          {"hours": [int], "max_grid_kwh": float}
+- no_op:                    null
 
-Hard rules:
+Rules:
 1. Return exactly one entry per operator note, in note_index order 0..N-1.
 2. "hours" is a list of unique integers 0..23 in ascending order.
 3. Time windows are start-inclusive, end-exclusive.
-   Example: "1 PM to 3 PM" -> [13, 14].
-   Example: "6 PM until 9 PM" -> [18, 19, 20].
-4. For no_op: applies=false and structured_adjustment=null.
-5. For every non-no_op directive: applies=true.
-6. If a note is irrelevant to today's energy schedule, mark it no_op.
-   Do NOT invent unsupported directive types.
-7. Percentage normalization: "X% reduction" -> factor = 1 - X/100.
-   "roughly 25% of forecast" -> factor = 0.25.
-8. Relative reserve language ("50% of capacity") must be converted to an
-   absolute kWh value using the battery capacity you are given.
-9. Do not include any prose outside the JSON object.
+   "1 PM to 3 PM" -> [13, 14]. "6 PM until 9 PM" -> [18, 19, 20].
+4. no_op: applies=false, structured_adjustment=null.
+   Every other directive: applies=true.
+5. "X% reduction" -> factor = 1 - X/100.
+   "X% of forecast" -> factor = X/100.
+6. "X% of capacity" reserve -> absolute kWh using the battery capacity given.
+7. If a note is unrelated to today's energy schedule, mark it no_op.
+8. Do not include any prose outside the JSON object.
 """
 
 
-def _build_user_prompt(
-    operator_notes: list[str],
-    hours: list[dict],
-    battery: dict,
-) -> str:
-    """Compose the payload the LLM actually reasons over."""
-    battery_view = {
-        "capacity_kwh": battery["capacity_kwh"],
-        "initial_energy_kwh": battery["initial_energy_kwh"],
-        "minimum_energy_kwh": battery["minimum_energy_kwh"],
-        "max_charge_kwh_per_hour": battery["max_charge_kwh_per_hour"],
-        "max_discharge_kwh_per_hour": battery["max_discharge_kwh_per_hour"],
-    }
-    hour_view = [
-        {
-            "hour": h["hour"],
-            "demand_kwh": h["demand_kwh"],
-            "solar_kwh": h["solar_kwh"],
-            "tariff_bdt_per_kwh": h["tariff_bdt_per_kwh"],
-        }
-        for h in hours
-    ]
+def _build_user_prompt(operator_notes, hours, battery) -> str:
+    """Only send what the LLM needs: notes + battery capacity."""
+    battery_view = {"capacity_kwh": battery["capacity_kwh"]}
     return (
         "BATTERY:\n"
         + json.dumps(battery_view, indent=2)
-#        + "\n\nHOURS:\n"
-#        + json.dumps(hour_view, indent=2)
         + "\n\nOPERATOR NOTES:\n"
         + json.dumps(operator_notes, indent=2)
     )
 
 
 def _coerce_to_raw_interpretation(result: Any) -> dict:
-    """
-    Normalize whatever Groq returns into a dict with a
-    'directive_interpretation' list.
-    """
     if isinstance(result, dict) and "directive_interpretation" in result:
         return result
     if isinstance(result, list):
@@ -104,26 +126,31 @@ def _coerce_to_raw_interpretation(result: Any) -> dict:
     )
 
 
+# --- public API -------------------------------------------------------------
+
 def interpret_notes(
     operator_notes: list[str],
     hours: list[dict],
     battery: dict,
 ) -> dict:
-    """
-    Return the raw LLM interpretation as a dict with a
-    'directive_interpretation' list.
+    key = _cache_key(operator_notes, battery)
+    hit = _cache_get(key)
+    if hit is not None:
+        logger.info("interpret_notes: cache hit key=%s", key[:8])
+        return hit
 
-    The caller (route) is responsible for running guardrails before
-    handing the result to the optimizer.
-    """
     user_prompt = _build_user_prompt(operator_notes, hours, battery)
-
     raw = call_json(
         system_prompt=SYSTEM_PROMPT,
         user_prompt=user_prompt,
         temperature=0.0,
+        max_tokens=1024,
     )
-    return _coerce_to_raw_interpretation(raw)
+    result = _coerce_to_raw_interpretation(raw)
+
+    if _looks_cacheable(result):
+        _cache_put(key, result)
+    return result
 
 
 def interpret_notes_with_retry(
@@ -132,14 +159,10 @@ def interpret_notes_with_retry(
     battery: dict,
     guardrail_error: str,
 ) -> dict:
-    """
-    Second-chance call: replay the previous guardrail error back to the LLM
-    so it can correct its own output.
-    """
     base_prompt = _build_user_prompt(operator_notes, hours, battery)
     user_prompt = (
         base_prompt
-        + "\n\nYour previous response failed deterministic validation with:\n"
+        + "\n\nYour previous JSON failed deterministic validation with:\n"
         + guardrail_error
         + "\n\nReturn corrected JSON only."
     )
@@ -147,5 +170,6 @@ def interpret_notes_with_retry(
         system_prompt=SYSTEM_PROMPT,
         user_prompt=user_prompt,
         temperature=0.0,
+        max_tokens=768,
     )
     return _coerce_to_raw_interpretation(raw)
